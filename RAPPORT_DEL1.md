@@ -105,8 +105,10 @@ When you have a final answer:
 ANSWER: <your complete answer to the user>
 
 Rules:
+- CRITICAL: Never include both COMMAND and ANSWER in the same response.
+- Always wait for the OBSERVATION before giving an ANSWER.
 - Only use THOUGHT/ACTION/COMMAND or ANSWER — never mix them.
-- Wait for the OBSERVATION before continuing.
+- Do NOT assume the output of a command. Always wait for the actual OBSERVATION.
 - Keep commands simple and safe.
 - If a command fails, try a different approach.
 """
@@ -116,7 +118,7 @@ System-prompten är **kärnan i hela agenten**. Det är den som gör att modelle
 
 Notera att detta skickas som `system`-parametern i API-anropet – inte som ett vanligt meddelande. System-prompten sätter ramarna för hela konversationen.
 
-**Varför det fungerar:** LLM:er som Claude är tränade att följa instruktioner. När vi säger "respond in EXACTLY this format" och visar formatet, kommer modellen i de allra flesta fall att lyda. Men inte alltid – det är därför vi behöver robust parsning och fallback-hantering (se sektion 5.3).
+**Varför det fungerar:** LLM:er som Claude är tränade att följa instruktioner. När vi säger "respond in EXACTLY this format" och visar formatet, kommer modellen i de allra flesta fall att lyda. Men inte alltid – det är därför vi behöver robust parsning och fallback-hantering (se sektion 5.3 och 7.1).
 
 ### 5.3 Parsningsfunktioner
 
@@ -262,69 +264,71 @@ def run_agent(user_task: str) -> None:
             max_tokens=1024,
             system=SYSTEM_PROMPT,
             messages=messages,
+            stop_sequences=["OBSERVATION"],
         )
         model_text = response.content[0].text.strip()
 
-        # 2. Kolla om det är ett slutsvar
+        # 2. Kolla efter kommando FÖRST
+        command = parse_command(model_text)
+
+        if command is not None:
+            if ask_user_confirmation(command):
+                observation = run_command(command)
+            else:
+                observation = "User declined to run the command."
+
+            messages.append({"role": "assistant", "content": model_text})
+            messages.append(
+                {"role": "user", "content": f"OBSERVATION: {observation}"})
+            step += 1
+            continue
+
+        # 3. Kolla efter slutsvar (bara om inget kommando)
         if is_final_answer(model_text):
             print(extract_answer(model_text))
             break
 
-        # 3. Plocka ut kommandot
-        command = parse_command(model_text)
-        if command is None:
-            break
-
-        # 4. Fråga användaren och kör
-        if ask_user_confirmation(command):
-            observation = run_command(command)
-        else:
-            observation = "User declined to run the command."
-
-        # 5. Bygg vidare på konversationshistoriken
-        messages.append({"role": "assistant", "content": model_text})
-        messages.append({"role": "user", "content": f"OBSERVATION: {observation}"})
-
-        step += 1
+        # 4. Fallback: behandla som slutsvar
+        print(model_text)
+        break
 ```
 
 Detta är hela ReAct-loopen. Steg för steg:
 
 **Steg 1 – API-anropet:**
-`client.messages.create()` skickar hela konversationshistoriken till Claude. Notera att det INTE finns någon `tools`-parameter – det är vår system-prompt som styr formatet, inte API:ts inbyggda function-calling.
+`client.messages.create()` skickar hela konversationshistoriken till Claude. Notera:
+- Det finns INGEN `tools`-parameter – det är vår system-prompt som styr formatet, inte API:ts inbyggda function-calling.
+- `stop_sequences=["OBSERVATION"]` gör att modellen stoppas om den försöker generera en observation själv. Vi vill att observationen kommer från det riktiga kommandoresultatet, inte från modellens fantasi.
 
-**Steg 2 – Kolla slutsvar:**
-Om modellen svarade med "ANSWER:" är vi klara. Loopen bryts.
+**Steg 2 – Kolla efter kommando FÖRST:**
+Vi kollar efter COMMAND innan vi kollar efter ANSWER. Om modellen bryter mot reglerna och inkluderar båda i samma svar, prioriterar vi att köra kommandot. Efter exekvering används `continue` för att gå tillbaka till toppen av loopen.
 
-**Steg 3 – Plocka ut kommando:**
-Om det inte var ett slutsvar, försök hitta ett "COMMAND:" i svaret. Om det inte finns (modellen svarade i fel format) – avbryt.
+**Steg 3 – Kolla efter slutsvar:**
+Bara om det INTE fanns något kommando kollar vi efter ANSWER. Om det finns – skriv ut svaret och bryt loopen.
 
-**Steg 4 – Säkerhet och exekvering:**
-Visa kommandot, fråga y/n, kör det om godkänt.
-
-**Steg 5 – Bygg historik:**
-Det här är avgörande. Vi lägger till modellens svar som `"assistant"` och kommandots resultat som `"user"` med prefixet "OBSERVATION:". Nästa varv skickas allt till API:t igen. Modellen ser: uppgiften → sitt eget resonemang → vad kommandot returnerade → och kan fortsätta därifrån.
+**Steg 4 – Fallback:**
+Om modellen varken svarade med COMMAND eller ANSWER (t.ex. svarade med en snygg tabell i fritext) – behandla hela svaret som ett slutsvar istället för att krascha.
 
 #### Konversationshistoriken växer för varje steg:
 
 **Varv 1:**
 ```
-user: "List all files"
+user: "Create a file called test.py that prints Hello World, then run it"
 ```
 
 **Varv 2:**
 ```
-user: "List all files"
-assistant: "THOUGHT: ... ACTION: bash COMMAND: ls -la"
-user: "OBSERVATION: total 64 ..."
+user: "Create a file called test.py that prints Hello World, then run it"
+assistant: "THOUGHT: I'll create test.py... ACTION: bash COMMAND: echo 'print(\"Hello World\")' > test.py && python3 test.py"
+user: "OBSERVATION: Hello World"
 ```
 
 **Varv 3:**
 ```
-user: "List all files"
-assistant: "THOUGHT: ... ACTION: bash COMMAND: ls -la"
-user: "OBSERVATION: total 64 ..."
-assistant: "ANSWER: Here are all files..."
+user: "Create a file called test.py that prints Hello World, then run it"
+assistant: "THOUGHT: I'll create test.py... ACTION: bash COMMAND: echo 'print(\"Hello World\")' > test.py && python3 test.py"
+user: "OBSERVATION: Hello World"
+assistant: "ANSWER: I created test.py and ran it successfully. The output was Hello World."
 ```
 
 ---
@@ -345,6 +349,7 @@ En agent som kör bash-kommandon kan potentiellt:
 1. **Manuell bekräftelse (y/n):** Varje kommando visas för användaren innan det körs. Användaren kan neka.
 2. **Timeout (30 sekunder):** Kommandon som hänger sig avbryts automatiskt.
 3. **max_tokens (1024):** Begränsar modellens svarslängd per anrop, vilket indirekt begränsar kostnaderna.
+4. **stop_sequences:** Hindrar modellen från att generera egna OBSERVATION-block, vilket säkerställer att bara riktiga kommandoresultat används.
 
 ### 6.3 Möjliga förbättringar (för Del 2)
 
@@ -355,21 +360,45 @@ En agent som kör bash-kommandon kan potentiellt:
 
 ---
 
-## 7. Observerade problem och lärdomar
+## 7. Buggar, iterationer och lärdomar
 
-### 7.1 Modellen följer inte alltid formatet
+### 7.1 Bugg: Modellen blandade COMMAND och ANSWER i samma svar
 
-Vid testkörning svarade modellen ibland med en snygg tabell istället för att börja med "ANSWER:". Parsern hittade varken "COMMAND:" eller "ANSWER:" och agenten stoppades med "Could not parse a command or answer."
+**Problem:** Vid testning av uppgiften "Create a file called test.py that prints Hello World, then run it" svarade modellen med både ett COMMAND-block och ett ANSWER-block i samma svar. Eftersom den ursprungliga koden kollade `is_final_answer()` före `parse_command()` hittade den "ANSWER:" först och hoppade direkt till slutsvaret — utan att köra kommandot och utan att fråga y/n.
 
-**Lärdom:** Man kan aldrig lita till 100% på att en LLM följer instruktioner exakt. Robust parsning med fallback-hantering är nödvändigt. I vår kod innebär det att om parsern inte hittar ett förväntat mönster bör vi behandla svaret som ett slutsvar snarare än att krascha.
+**Analys:** Modellen bröt mot system-promptens regel "never mix them in the same response". Det avslöjade två problem:
+1. **Prompten var inte tydlig nog** – regeln behövde förstärkas
+2. **Kodens parsningsordning var fel** – den borde prioritera COMMAND över ANSWER
 
-### 7.2 Modellversioner och deprecation
+**Lösning (två nivåer):**
+
+*Prompt-nivå (förebyggande):* Tre nya regler tillagda i system-prompten:
+- "CRITICAL: Never include both COMMAND and ANSWER in the same response"
+- "Always wait for the OBSERVATION before giving an ANSWER"  
+- "Do NOT assume the output of a command"
+
+*Kod-nivå (defensiv programmering):* Ändrad ordning i loopen:
+- Kolla efter COMMAND **först** – om det finns, kör det och `continue`
+- Kolla efter ANSWER **bara om** inget kommando hittades
+- Fallback: om varken COMMAND eller ANSWER hittas, behandla svaret som slutsvar
+
+**Lärdom:** Man kan aldrig lita till 100% på att en LLM följer instruktioner exakt. Robust agentdesign kräver försvar på **två nivåer**: prompten (förebygg att modellen bryter format) och koden (hantera det gracefully om den gör det ändå). Det här är ett grundläggande mönster inom agentutveckling.
+
+### 7.2 Bugg: Modellen svarade i fritext utan ANSWER-prefix
+
+**Problem:** Vid en testkörning med svenska ("lista allt i denna folder") svarade modellen med en snygg formaterad tabell istället för att börja med "ANSWER:". Parsern hittade varken "COMMAND:" eller "ANSWER:" och agenten stoppades med felmeddelandet "Could not parse a command or answer."
+
+**Lösning:** Lade till en fallback i loopen – om varken COMMAND eller ANSWER kan parsas, behandla hela svaret som ett slutsvar och visa det för användaren istället för att krascha.
+
+**Lärdom:** LLM:er är probabilistiska – samma prompt kan ge olika format beroende på kontext, språk, och slump. Defensiv parsning med fallback-mekanismer är nödvändigt.
+
+### 7.3 Problem: Modellversion deprecation
 
 Den ursprungliga modellsträngen `claude-sonnet-4-20250514` var utfasad och gav 404-error. Vi bytte till `claude-sonnet-4-6` som är den nuvarande Sonnet-versionen.
 
 **Lärdom:** Modell-ID:n ändras över tid. Håll koll på Anthropics dokumentation och var beredd att uppdatera.
 
-### 7.3 Python-miljö på Mac
+### 7.4 Problem: Python-miljö på Mac
 
 `pip install` gav error på grund av Macs "externally managed environment". Lösningen var att skapa en virtuell miljö med `python3 -m venv venv`.
 
@@ -386,6 +415,7 @@ Den ursprungliga modellsträngen `claude-sonnet-4-20250514` var utfasad och gav 
 | **Regex för parsning** | Enkelt, tydligt, och tillräckligt för det strukturerade format vi definierat. |
 | **subprocess.run()** | Standardbiblioteket i Python för att köra externa kommandon. Bättre än os.system() eftersom det fångar output. |
 | **python-dotenv** | Håller API-nycklar utanför koden. Bästa praxis för alla projekt. |
+| **stop_sequences** | Hindrar modellen från att fabricera kommandoresultat. |
 
 ---
 
@@ -393,7 +423,7 @@ Den ursprungliga modellsträngen `claude-sonnet-4-20250514` var utfasad och gav 
 
 Del 1 lägger grunden som Del 2 och Del 3 bygger vidare på:
 
-- **Del 2** kommer byta textparsning mot structured output och lägga till filredigering, multipla tool-calls utan y/n varje gång, config-fil för system-prompten, och starkare säkerhet.
-- **Del 3** kommer koppla ihop alla studenters agenter i en gemensam chatt för att samarbeta kring mjukvaruutveckling, med rate-limiting och token-budgetar.
+- **Del 2** kommer byta textparsning mot structured output och lägga till filredigering, multipla tool-calls utan y/n varje gång, config-fil för system-prompten, och starkare säkerhet med blocklista mot destruktiva kommandon. System-prompten ska dessutom begränsa agenten till enbart software engineering.
+- **Del 3** kommer koppla ihop alla studenters agenter i en gemensam chatt på RunPod för att samarbeta kring ett mjukvaruprojekt, med rate-limiting, token-budgetar, och smart hantering av gruppkommunikation.
 
 Men grundmönstret – ReAct-loopen med THOUGHT → ACTION → OBSERVATION → ANSWER – förblir detsamma genom alla tre delar.
