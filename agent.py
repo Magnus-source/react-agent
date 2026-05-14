@@ -41,8 +41,10 @@ When you have a final answer and no more commands are needed, respond in EXACTLY
 ANSWER: <your complete answer to the user>
 
 Rules:
+- CRITICAL: Never include both COMMAND and ANSWER in the same response.
+- Always wait for the OBSERVATION before giving an ANSWER.
 - Only use THOUGHT/ACTION/COMMAND or ANSWER — never mix them in the same response.
-- Wait for the OBSERVATION before continuing.
+- Do NOT assume the output of a command. Always wait for the actual OBSERVATION.
 - Keep commands simple and safe.
 - If a command fails, try a different approach.
 """
@@ -158,7 +160,26 @@ def run_agent(user_task: str) -> None:
         model_text = response.content[0].text.strip()
         print(f"\n{model_text}")
 
-        # ── Check for final answer ────────────────────────────────────────────
+        # ── Check for a command FIRST (priority over answer) ──────────────────
+        command = parse_command(model_text)
+
+        if command is not None:
+            # There's a command to run — do that before checking for answer
+            if ask_user_confirmation(command):
+                observation = run_command(command)
+                print(f"\n  OBSERVATION: {observation}")
+            else:
+                observation = "User declined to run the command."
+                print(f"\n  OBSERVATION: {observation}")
+
+            # Append the exchange to conversation history
+            messages.append({"role": "assistant", "content": model_text})
+            messages.append(
+                {"role": "user", "content": f"OBSERVATION: {observation}"})
+            step += 1
+            continue
+
+        # ── Check for final answer (only if no command found) ─────────────────
         if is_final_answer(model_text):
             print("\n" + "─" * 60)
             print("FINAL ANSWER:")
@@ -166,30 +187,12 @@ def run_agent(user_task: str) -> None:
             print("─" * 60)
             break
 
-        # ── Check for a command to run ────────────────────────────────────────
-        command = parse_command(model_text)
-
-        if command is None:
-            # Model didn't produce a command or answer — something went wrong
-            print("\n[Agent] Could not parse a command or answer. Stopping.")
-            break
-
-        # ── Ask user to confirm before running ───────────────────────────────
-        if ask_user_confirmation(command):
-            observation = run_command(command)
-            print(f"\n  OBSERVATION: {observation}")
-        else:
-            observation = "User declined to run the command."
-            print(f"\n  OBSERVATION: {observation}")
-
-        # ── Append the exchange to conversation history ───────────────────────
-        # The model's THOUGHT/ACTION/COMMAND goes in as "assistant"
-        messages.append({"role": "assistant", "content": model_text})
-        # The observation goes back in as "user" so the model can react to it
-        messages.append(
-            {"role": "user", "content": f"OBSERVATION: {observation}"})
-
-        step += 1
+        # ── Fallback: treat as final answer if nothing parsed ─────────────────
+        print("\n" + "─" * 60)
+        print("FINAL ANSWER:")
+        print(model_text)
+        print("─" * 60)
+        break
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
